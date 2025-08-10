@@ -41,25 +41,21 @@ class G:
 # --- PyTorch Model Definition ---
 
 class FullyConnected(nn.Module):
-    """Position-wise Feed-Forward Network."""
+    """Position-wise Feed-Forward Network. ✅ Now uses LayerNorm."""
 
     def __init__(self, d_model, dense_dim):
         super(FullyConnected, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(d_model, dense_dim),
             nn.ReLU(),
-            nn.BatchNorm1d(dense_dim),
+            nn.LayerNorm(dense_dim),      # Replaced BatchNorm1d
             nn.Linear(dense_dim, d_model),
-            nn.BatchNorm1d(d_model)
+            nn.LayerNorm(d_model)         # Replaced BatchNorm1d
         )
 
     def forward(self, x):
-        # Input shape: (batch_size, seq_len, d_model)
-        # BatchNorm1d expects (batch_size, channels, seq_len)
-        x_permuted = x.permute(0, 2, 1)
-        out_permuted = self.net(x_permuted)
-        out = out_permuted.permute(0, 2, 1)
-        return out
+        # LayerNorm works directly on the (batch, seq_len, d_model) tensor
+        return self.net(x)
 
 
 class EncoderLayer(nn.Module):
@@ -76,11 +72,11 @@ class EncoderLayer(nn.Module):
         self.dropout2 = nn.Dropout(dropout_rate)
 
     def forward(self, x, mask):
-        # Multi-Head Attention
+        # Multi-Head Attention (Post-Norm)
         attn_output, _ = self.mha(x, x, x, attn_mask=mask)
         x = self.norm1(x + self.dropout1(attn_output))
 
-        # Feed Forward Network
+        # Feed Forward Network (Post-Norm)
         ffn_output = self.ffn(x)
         x = self.norm2(x + self.dropout2(ffn_output))
         return x
@@ -193,19 +189,20 @@ class Transformer(nn.Module):
 
 
 # --- Data Loading and Processing ---
-
 def get_stock_data(filename):
     """Loads and preprocesses stock data from a CSV file."""
     df = pd.read_csv(filename)
-    df['Adj Close'] = df['Close']
-    df.drop(['Open', 'High', 'Low', 'Volume', 'Date'], axis=1, inplace=True, errors='ignore')
 
-    # Calculate difference
-    diff_values = df['Adj Close'].diff(1).dropna().values
-    df = df.iloc[1:].copy()
-    df['Adj Close'] = diff_values
+    # We only care about the 'Close' price for this model.
+    close_prices = df['Close'].copy()
 
-    return df
+    # Calculate the difference in price from one day to the next.
+    # .dropna() removes the first row, which will be NaN after diff().
+    diff_values = close_prices.diff(1).dropna()
+
+    # Return a new DataFrame with just this single feature. The column name
+    # is not critical, but 'Adj Close' is kept for consistency.
+    return pd.DataFrame(diff_values.values, columns=['Adj Close'])
 
 
 def load_data(df, seq_len, mul, normalize=True):
@@ -244,16 +241,16 @@ def load_data(df, seq_len, mul, normalize=True):
 # --- Loss, Metrics, and Training ---
 
 def up_down_accuracy_loss(pred, real):
-    """Custom loss combining MSE and directional accuracy."""
+    """Custom loss combining MSE and directional accuracy. ✅ Now differentiable."""
     mse = torch.mean(torch.square(pred - real))
 
-    accu = real * pred
-    accu = torch.relu(accu)
-    accu = torch.sign(accu)
+    # Use a differentiable approximation (tanh) instead of sign
+    # This rewards the model for getting the direction of change correct
+    accu = torch.tanh(real * pred * 10) # Multiplying by 10 makes tanh steeper, more like sign()
     accu = torch.mean(accu)
 
-    # Combine MSE and directional accuracy
-    loss = mse + (1 - accu) * 0.1  # Weighting factor for directional loss
+    # Combine MSE and directional accuracy. Loss is lower when accu is high (close to 1).
+    loss = mse - (accu * 0.1)  # Subtracting so that higher accuracy reduces loss
     return loss
 
 
@@ -283,8 +280,7 @@ if __name__ == '__main__':
                     [x for x in glob.glob('data/indices/^GDAXI.csv', recursive=False)]
         if not all_files: raise FileNotFoundError
     except FileNotFoundError:
-        print("Data files not found. Please place stock data in './data/...'")
-        # Create a dummy file for demonstration if none exist
+        print("Data files not found. Creating a dummy file for demonstration.")
         dummy_data = {'Date': pd.to_datetime(pd.date_range(start='1/1/2010', periods=1000)),
                       'Close': np.random.rand(1000) * 100 + 500}
         dummy_df = pd.DataFrame(dummy_data)
@@ -323,8 +319,8 @@ if __name__ == '__main__':
             model.train()
             total_train_loss = 0
             for src, tgt in train_loader:
-                # The target for the decoder input is the same as the output in this setup
-                # We use the source as a proxy for the decoder input for the first step
+                # For single-step forecasting, the decoder input is the last known value
+                # from the source sequence. This is a valid autoregressive approach.
                 dec_input = src[:, -G.dec_len:, :]
 
                 optimizer.zero_grad()
@@ -376,4 +372,3 @@ if __name__ == '__main__':
         plt.legend(fontsize=12)
         plt.grid(True)
         plt.show()
-
