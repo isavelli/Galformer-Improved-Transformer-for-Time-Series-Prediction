@@ -1,746 +1,379 @@
-import math
-from math import floor
-import numpy
-import sklearn
-import tensorflow
-import tensorflow as tf
-from sklearn.metrics import r2_score
-from tensorflow.keras.layers import MultiHeadAttention, Dense, Input, Dropout, BatchNormalization
-import tensorflow.keras.backend as K
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from sklearn import preprocessing
-from sklearn.preprocessing import MaxAbsScaler, MinMaxScaler
-from sklearn.model_selection import train_test_split
-import time
-from dataclasses import dataclass
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
 import pandas as pd
+import sklearn
+from sklearn.metrics import r2_score
+from sklearn import preprocessing
 import matplotlib.pyplot as plt
-from transformer_helper_dc import *
-from rolling_and_plot_dc import data_plot, rolling_split, normalize, validate
+import time
+import glob
+import math
+from math import floor
 
-tf.config.run_functions_eagerly(True)
-
-physical_devices = tf.config.experimental.list_physical_devices('GPU')
-if len(physical_devices) > 0:
-    for k in range(len(physical_devices)):
-        tf.config.experimental.set_memory_growth(physical_devices[k], True)
-        print('memory growth:', tf.config.experimental.get_memory_growth(physical_devices[k]))
-else:
-    print("Not enough GPU hardware devices available")
+# Import helper functions from the new PyTorch helper file
+from transformer_helper_pytorch import positional_encoding, create_causal_mask
 
 
+# --- Configuration ---
 class G:
-    # preprocess
-
-    batch_size = 64 # 128
-    src_len = 20  # encoder input sequence length, the 5 is an arbitrary number
+    """A static class for holding hyperparameters."""
+    # Data Preprocessing
+    batch_size = 64
+    src_len = 20
     dec_len = 1
-    tgt_len = 1  # decoder input sequence length, same length as transformer output
+    tgt_len = 1
     window_size = src_len
     mulpr_len = tgt_len
-    # network
+    # Network Architecture
     d_model = 512
     dense_dim = 2048
-    num_features = 1  # current, voltage, and soc at t minus G.window_size -> t minus 1   就输入一个差分的adjclose
+    num_features = 1
     num_heads = 8
-    d_k = int(d_model/num_heads)
     num_layers = 6
     dropout_rate = 0.1
-    # learning_rate_scheduler
-    T_i = 1
-    T_mult = 2
-    T_cur = 0.0
-    # training
-    epochs = 200 #21 should be T_i + a power of T_mult, ex) T_mult = 2 -> epochs = 2**5 + 1 = 32+1 = 33   257
-    learning_rate = 0.003#0.0045
-    min_learning_rate = 7e-11
-    #weight_decay = 0.0 #No weight decay param in the the keras optimizers
-
-l = ['000001.SS', 'AAPL', 'BTC-USD' , 'DJI', 'Gold_daily','GSPC','IXIC']
-
-for i in l:
-    filename = 'C:/lyx/learning/会议论文/三支同时期数据/' + i + '.csv'
-    df = pd.read_csv(filename,delimiter=',',usecols=['Date','Open','High','Low','Close', 'Adj Close','Volume'])
-    df = df.sort_values('Date')
-    division_rate1 = 0.8
-    division_rate2 = 0.9
-
-    seq_len = G.src_len  # 20 how long of a preceeding sequence to collect for RNN
-    tgt = G.tgt_len
-    mulpre = G.mulpr_len  # how far into the future are we trying to predict?
-    window = G.window_size
-
-    def classify(current, future):
-        if float(future) > float(current):
-            return 1
-        else:
-            return 0
+    # Training
+    epochs = 100  # Reduced for quicker demonstration
+    learning_rate = 0.001
 
 
-    def get_stock_data():
-        df = pd.read_csv(filename)
-        df.drop(['Date', 'Close'], axis=1, inplace=True)#由于date不连续,这时候保留5维
-        list = df['Adj Close']
-        list1 = list.diff(1).dropna()  # list1为list的1阶差分序列,序列的序号从1开始,所以要tolist,这样序号才从0开始. 但是列表不能调用diff
-        # 或者list1 = np.diff(list)[1:]
-        list = list.tolist()
-        list1 = list1.tolist()
+# --- PyTorch Model Definition ---
 
-        list1 = np.array(list1)#array才能reshape
-        df = df.drop(0, axis=0)
-        # print(df1.head())
-        df['Adj Close'] = list1
-        df = df.reset_index(drop=True)
-        print(df.head())
-        return df,list,list1
+class FullyConnected(nn.Module):
+    """Position-wise Feed-Forward Network."""
 
+    def __init__(self, d_model, dense_dim):
+        super(FullyConnected, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, dense_dim),
+            nn.ReLU(),
+            nn.BatchNorm1d(dense_dim),
+            nn.Linear(dense_dim, d_model),
+            nn.BatchNorm1d(d_model)
+        )
 
-    #先划分训练集测试集,再标准化归一化,避免数据泄露
-    def load_data(df, seq_len , mul, normalize=True):
-        amount_of_features = 1  # columns是列索引,index是行索引
-        data = df.values
-        row1 = round(division_rate1 * data.shape[0])  #0.8  split可改动!!!!!!!#round是四舍五入,0.9可能乘出来小数  #shape[0]是result列表中子列表的个数
-        row2 = round(division_rate2 * data.shape[0])  #0.9
-        #训练集和测试集划分
-        train = data[:int(row1), :]
-        valid = data[int(row1):int(row2), :]
-        test = data[int(row2): , :]
-
-        print('train', train)
-        print('valid', valid)
-        print('test', test)
-
-        # 训练集和测试集归一化
-        if normalize:
-            standard_scaler = preprocessing.StandardScaler()
-            train = standard_scaler.fit_transform(train)
-            valid = standard_scaler.transform(valid)
-            test = standard_scaler.transform(test)
-
-        print('train',train)
-        print('valid', valid)
-        print('test', test)
-        X_train = []  # train列表中4个特征记录
-        y_train = []
-        X_valid = []
-        y_valid = []
-        X_test = []
-        y_test = []
-        train_samples=train.shape[0]-seq_len-mul+1
-        valid_samples = valid.shape[0] - seq_len - mul + 1
-        test_samples = test.shape[0] - seq_len - mul + 1
-        for i in range(0,train_samples,mul):  # maximum date = lastest  date - sequence length  #index从0到极限maximum,所有天数正好被滑窗采样完
-            X_train.append(train[i:i + seq_len,-2])#每个滑窗每天四个特征
-            y_train.append(train[i + seq_len:i+seq_len+tgt,-2])#-1为成交量,倒数第二个才是adj close
-
-        for i in range(0,valid_samples,mul):  # maximum date = lastest  date - sequence length  #index从0到极限maximum,所有天数正好被滑窗采样完
-            X_valid.append(valid[i:i + seq_len,-2])#每个滑窗每天四个特征
-            y_valid.append(valid[i+seq_len:i+seq_len+tgt,-2])#-1为成交量,倒数第二个才是adj close
-
-        for i in range(0, test_samples,mul):  # maximum date = lastest date - sequence length  #index从0到极限maximum,所有天数正好被滑窗采样完
-            X_test.append(test[i:i + seq_len, -2])  # 每个滑窗每天四个特征
-            y_test.append(test[i+seq_len:i+seq_len+tgt, -2])  # -1即取最后一个特征
-        # X都对应全部4特征,y都对应adj close   #train都是前百分之90,test都是后百分之10
-        X_train = np.array(X_train)
-        y_train = np.array(y_train)
-        X_valid = np.array(X_valid)
-        y_valid = np.array(y_valid)
-        X_test = np.array(X_test)
-        y_test = np.array(y_test)
-        print('train', train.shape)
-        print(train)
-        print('valid', valid.shape)
-        print(valid)
-        print('test', test.shape)
-        print(test)
-
-        print('X_train', X_train.shape)
-        print('y_train', y_train.shape)
-        print('X_valid', X_valid.shape)
-        print('y_valid', y_valid.shape)
-        print('X_test', X_test.shape)
-        print('y_test', y_test.shape)
-        print('df', df)
-        X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1], amount_of_features))  # (90%maximum, seq-1 ,4) #array才能reshape
-        X_valid = np.reshape(X_valid, (X_valid.shape[0], X_valid.shape[1], amount_of_features))
-        X_test = np.reshape(X_test, (X_test.shape[0], X_test.shape[1], amount_of_features))  # (10%maximum, seq-1 ,4) #array才能reshape、
+    def forward(self, x):
+        # Input shape: (batch_size, seq_len, d_model)
+        # BatchNorm1d expects (batch_size, channels, seq_len)
+        x_permuted = x.permute(0, 2, 1)
+        out_permuted = self.net(x_permuted)
+        out = out_permuted.permute(0, 2, 1)
+        return out
 
 
-        print('X_train', X_train.shape)
-        print('X_valid', X_valid.shape)
-        print('X_test', X_test.shape)
-        return X_train, y_train, X_valid, y_valid, X_test, y_test  # x是训练的数据，y是数据对应的标签,也就是说y是要预测的那一个特征!!!!!!
+class EncoderLayer(nn.Module):
+    """A single layer of the Transformer Encoder."""
+
+    def __init__(self, d_model, num_heads, dense_dim, dropout_rate):
+        super(EncoderLayer, self).__init__()
+        self.mha = nn.MultiheadAttention(d_model, num_heads, dropout=dropout_rate, batch_first=True)
+        self.ffn = FullyConnected(d_model, dense_dim)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout_rate)
+        self.dropout2 = nn.Dropout(dropout_rate)
+
+    def forward(self, x, mask):
+        # Multi-Head Attention
+        attn_output, _ = self.mha(x, x, x, attn_mask=mask)
+        x = self.norm1(x + self.dropout1(attn_output))
+
+        # Feed Forward Network
+        ffn_output = self.ffn(x)
+        x = self.norm2(x + self.dropout2(ffn_output))
+        return x
 
 
-    #################################
+class Encoder(nn.Module):
+    """The Transformer Encoder stack."""
 
-    def FullyConnected():
-        return tf.keras.Sequential([
-            tf.keras.layers.Dense(G.dense_dim, activation='relu',
-                                  kernel_initializer = tf.keras.initializers.HeNormal(),
-                                  bias_initializer = tf.keras.initializers.RandomUniform(minval=0.005, maxval = 0.08)
-                                 ),
-            # (G.batch_size, G.window_size, G.dense_dim)
+    def __init__(self, num_layers, d_model, num_heads, dense_dim, dropout_rate, max_pos_encoding, device):
+        super(Encoder, self).__init__()
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.device = device
 
-            #原来是relu
-            tf.keras.layers.BatchNormalization(momentum = 0.98, epsilon=5e-4),
-            #原来是G.dense_dim
-            tf.keras.layers.Dense(G.d_model,
-                                  kernel_initializer = tf.keras.initializers.HeNormal(),
-                                  bias_initializer = tf.keras.initializers.RandomUniform(minval=0.001, maxval = 0.01)
-                                 ),
-            # (G.batch_size, G.window_size, G.dense_dim)
-            tf.keras.layers.BatchNormalization(momentum = 0.95, epsilon=5e-4)
+        self.embedding = nn.Linear(G.num_features, d_model)
+        self.pos_encoding = positional_encoding(max_pos_encoding, d_model, device)
+
+        self.enc_layers = nn.ModuleList([
+            EncoderLayer(d_model, num_heads, dense_dim, dropout_rate) for _ in range(num_layers)
         ])
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x, mask):
+        seq_len = x.shape[1]
+        x = self.embedding(x) * math.sqrt(self.d_model)
+        x += self.pos_encoding[:, :seq_len, :]
+        x = self.dropout(x)
 
+        for i in range(self.num_layers):
+            x = self.enc_layers[i](x, mask)
+        return x
+
+
+class DecoderLayer(nn.Module):
+    """A single layer of the Transformer Decoder."""
+
+    def __init__(self, d_model, num_heads, dense_dim, dropout_rate):
+        super(DecoderLayer, self).__init__()
+        self.self_mha = nn.MultiheadAttention(d_model, num_heads, dropout=dropout_rate, batch_first=True)
+        self.cross_mha = nn.MultiheadAttention(d_model, num_heads, dropout=dropout_rate, batch_first=True)
+        self.ffn = FullyConnected(d_model, dense_dim)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout_rate)
+        self.dropout2 = nn.Dropout(dropout_rate)
+        self.dropout3 = nn.Dropout(dropout_rate)
+
+    def forward(self, x, enc_output, causal_mask, padding_mask):
+        # Masked Multi-Head Self-Attention
+        attn_output1, _ = self.self_mha(x, x, x, attn_mask=causal_mask)
+        x = self.norm1(x + self.dropout1(attn_output1))
+
+        # Cross-Attention
+        attn_output2, _ = self.cross_mha(x, enc_output, enc_output, attn_mask=padding_mask)
+        x = self.norm2(x + self.dropout2(attn_output2))
+
+        # Feed Forward Network
+        ffn_output = self.ffn(x)
+        x = self.norm3(x + self.dropout3(ffn_output))
+        return x
+
+
+class Decoder(nn.Module):
+    """The Transformer Decoder stack."""
+
+    def __init__(self, num_layers, d_model, num_heads, dense_dim, dropout_rate, max_pos_encoding, device):
+        super(Decoder, self).__init__()
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.device = device
+
+        self.embedding = nn.Linear(G.num_features, d_model)
+        self.pos_encoding = positional_encoding(max_pos_encoding, d_model, device)
+
+        self.dec_layers = nn.ModuleList([
+            DecoderLayer(d_model, num_heads, dense_dim, dropout_rate) for _ in range(num_layers)
+        ])
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x, enc_output, causal_mask):
+        seq_len = x.shape[1]
+        x = self.embedding(x) * math.sqrt(self.d_model)
+        x += self.pos_encoding[:, :seq_len, :]
+        x = self.dropout(x)
+
+        for i in range(self.num_layers):
+            x = self.dec_layers[i](x, enc_output, causal_mask, None)  # No padding mask for now
+        return x
+
 
-    class EncoderLayer(tf.keras.layers.Layer):
-        """
-        The encoder layer is composed by a multi-head self-attention mechanism,
-        followed by a simple, positionwise fully connected feed-forward network.
-        This archirecture includes a residual connection around each of the two
-        sub-layers, followed by batch normalization.
-        """
-
-        def __init__(self,
-                     num_heads,
-                     d_k,
-                     dropout_rate,
-                     batchnorm_eps):
-            super(EncoderLayer, self).__init__()
-
-            self.mha = MultiHeadAttention(
-                num_heads=num_heads,
-                key_dim=d_k,
-                dropout=dropout_rate,
-                kernel_initializer=tf.keras.initializers.HeNormal(),
-                kernel_regularizer=tf.keras.regularizers.L2(1e-4),
-                bias_initializer=tf.keras.initializers.RandomUniform(minval=0.001, maxval=0.01)
-            )
-
-            # feed-forward-network
-            self.ffn = FullyConnected()
-
-            self.batchnorm1 = BatchNormalization(momentum=0.95, epsilon=batchnorm_eps)
-            self.batchnorm2 = BatchNormalization(momentum=0.95, epsilon=batchnorm_eps)
-
-            self.dropout_ffn = Dropout(dropout_rate)
-
-        def call(self, x, training):
-            """
-            Forward pass for the Encoder Layer
-
-            Arguments:
-                x -- Tensor of shape (G.batch_size, G.window_size, G.num_features)
-                training -- Boolean, set to true to activate
-                            the training mode for dropout layers
-            Returns:
-                encoder_layer_out -- Tensor of shape (G.batch_size, G.window_size, G.num_features)
-            """
-            # Dropout is added by Keras automatically if the dropout parameter is non-zero during training
-
-            attn_output = self.mha(query=x,
-                                   value=x)  # Self attention
-
-            out1 = self.batchnorm1(tf.add(x, attn_output))  # (G.batch_size, G.src_len, G.dense_dim)
-
-            ffn_output = self.ffn(out1)
-
-            ffn_output = self.dropout_ffn(ffn_output)  # (G.batch_size, G.src_len, G.dense_dim)
-
-            encoder_layer_out = self.batchnorm2(tf.add(ffn_output, out1))
-            # (G.batch_size, G.src_len, G.dense_dim)
-            return encoder_layer_out
-
-
-    class Encoder(tf.keras.layers.Layer):
-        """
-        The entire Encoder starts by passing the input to an embedding layer
-        and using positional encoding to then pass the output through a stack of
-        encoder Layers
-
-        """
-
-        def __init__(self,
-                     num_layers=G.num_layers,
-                     num_heads=G.num_heads,
-                     num_features=G.num_features,
-                     d_model=G.d_model,
-                     d_k=G.d_k,
-                     dense_dim=G.dense_dim,
-                     maximum_position_encoding=G.src_len,
-                     dropout_rate=G.dropout_rate,
-                     batchnorm_eps=1e-4):
-            super(Encoder, self).__init__()
-
-            self.num_layers = num_layers
-
-            # linear input layer
-            self.lin_input = tf.keras.layers.Dense(d_model, activation="relu")
-
-            self.pos_encoding = positional_encoding(maximum_position_encoding,
-                                                    d_model)
-
-            self.enc_layers = [EncoderLayer(num_heads=num_heads,
-                                            d_k=d_k,
-                                            dropout_rate=dropout_rate,
-                                            batchnorm_eps=batchnorm_eps)
-                               for _ in range(self.num_layers)]
-
-        def call(self, x, training):
-            """
-            Forward pass for the Encoder
-
-            Arguments:
-                x -- Tensor of shape (G.batch_size, G.src_len, G.num_features)
-                training -- Boolean, set to true to activate
-                            the training mode for dropout layers
-                mask -- Boolean mask to ensure that the padding is not
-                        treated as part of the input
-            Returns:
-                Tensor of shape (G.batch_size, G.src_len, G.dense_dim)
-            """
-            x = self.lin_input(x)
-            seq_len = tf.shape(x)[1]
-            x += self.pos_encoding[:, :seq_len, :]
-
-            #应该concatenate！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！
-            for i in range(self.num_layers):
-                x = self.enc_layers[i](x, training)
-
-            return x  # (G.batch_size, G.src_len, G.dense_dim)
-
-
-    class DecoderLayer(tf.keras.layers.Layer):
-        """
-        The decoder layer is composed by two multi-head attention blocks,
-        one that takes the new input and uses self-attention, and the other
-        one that combines it with the output of the encoder, followed by a
-        fully connected block.
-        """
-
-        def __init__(self,
-                     num_heads,
-                     d_k,
-                     dropout_rate,
-                     batchnorm_eps):
-            super(DecoderLayer, self).__init__()
-
-            self.mha1 = MultiHeadAttention(
-                num_heads=num_heads,
-                key_dim=d_k,
-                dropout=dropout_rate,
-                kernel_initializer=tf.keras.initializers.HeNormal(),
-                kernel_regularizer=tf.keras.regularizers.L2(1e-4),
-                bias_initializer=tf.keras.initializers.RandomUniform(minval=0.001, maxval=0.01)
-            )
-
-            self.mha2 = MultiHeadAttention(
-                num_heads=num_heads,
-                key_dim=d_k,
-                dropout=dropout_rate,
-                kernel_initializer=tf.keras.initializers.HeNormal(),
-                kernel_regularizer=tf.keras.regularizers.L2(1e-4),
-                bias_initializer=tf.keras.initializers.RandomUniform(minval=0.001, maxval=0.01)
-            )
-
-            self.ffn = FullyConnected()
-
-            self.batchnorm1 = BatchNormalization(momentum=0.95, epsilon=batchnorm_eps)
-            self.batchnorm2 = BatchNormalization(momentum=0.95, epsilon=batchnorm_eps)
-            self.batchnorm3 = BatchNormalization(momentum=0.95, epsilon=batchnorm_eps)
-
-            self.dropout_ffn = Dropout(dropout_rate)
-
-        def call(self, y, enc_output, dec_ahead_mask, enc_memory_mask, training):
-            """
-            Forward pass for the Decoder Layer
-
-            Arguments:
-                y -- Tensor of shape (G.batch_size, G.tgt_len, 1) #the soc values for the batches
-                enc_output --  Tensor of shape(G.batch_size, G.num_features)
-                training -- Boolean, set to true to activate
-                            the training mode for dropout and batchnorm layers
-            Returns:
-                out3 -- Tensor of shape (G.batch_size, G.tgt_len, 1)
-            """
-
-            # BLOCK 1
-            # Dropout will be applied during training only
-            mult_attn_out1 = self.mha1(query=y,
-                                       value=y,
-                                       attention_mask=dec_ahead_mask,
-                                       return_attention_scores=False)
-            # (G.batch_size, G.tgt_len, G.dense_dim)
-
-            Q1 = self.batchnorm1(tf.add(y, mult_attn_out1))
-
-            # BLOCK 2
-            # calculate self-attention using the Q from the first block and K and V from the encoder output.
-            # Dropout will be applied during training
-            mult_attn_out2 = self.mha2(query=Q1,
-                                       value=enc_output,
-                                       key=enc_output,
-                                       attention_mask=enc_memory_mask,
-                                       return_attention_scores=False)
-
-            mult_attn_out2 = self.batchnorm2(tf.add(mult_attn_out1, mult_attn_out2))
-
-            # BLOCK 3
-            # pass the output of the second block through a ffn
-            ffn_output = self.ffn(mult_attn_out2)
-
-            # apply a dropout layer to the ffn output
-            ffn_output = self.dropout_ffn(ffn_output)
-
-            out3 = self.batchnorm3(tf.add(ffn_output, mult_attn_out2))
-            return out3
-
-
-    class Decoder(tf.keras.layers.Layer):
-        """
-
-        """
-
-        def __init__(self,
-                     num_layers=G.num_layers,
-                     num_heads=G.num_heads,
-                     num_features=G.num_features,
-                     d_model=G.d_model,
-                     d_k=G.d_k,
-                     dense_dim=G.dense_dim,
-                     target_size=G.num_features,
-                     maximum_position_encoding=G.dec_len,
-                     dropout_rate=G.dropout_rate,
-                     batchnorm_eps=1e-5):
-            super(Decoder, self).__init__()
-
-            self.num_layers = num_layers
-            self.pos_encoding = positional_encoding(maximum_position_encoding,
-                                                    d_model)
-
-            # linear input layer
-            self.lin_input = tf.keras.layers.Dense(d_model, activation="relu")
-
-            self.dec_layers = [DecoderLayer(num_heads=num_heads,
-                                            d_k=d_k,
-                                            dropout_rate=dropout_rate,
-                                            batchnorm_eps=batchnorm_eps
-                                            )
-                               for _ in range(self.num_layers)]
-            # look_ahead_masks for decoder:
-            self.dec_ahead_mask = create_look_ahead_mask(G.dec_len, G.dec_len)
-            self.enc_memory_mask = create_look_ahead_mask(G.dec_len, G.src_len)
-
-        def call(self, y, enc_output, training):
-            """
-            Forward  pass for the Decoder
-
-            Arguments:
-                y -- Tensor of shape (G.batch_size, G.tgt_len, G.dense_dim) #the final SOC values in the batches
-                enc_output --  Tensor of shape(G.batch_size, G.src_len, G.dense_dim)
-                training -- Boolean, set to true to activate
-                            the training mode for dropout layers
-            Returns:
-                y -- Tensor of shape (G.batch_size, G.tgt_len, 1)
-            """
-            y = self.lin_input(y)  # maps to dense_dim, the dimension of all the sublayer outputs.
-
-            dec_len = tf.shape(y)[1]
-            print('dec_len',dec_len)
-            y += self.pos_encoding[:, :dec_len, :]
-
-            # use a for loop to pass y through a stack of decoder layers and update attention_weights
-            for i in range(self.num_layers):
-                # pass y and the encoder output through a stack of decoder layers and save attention weights
-                y = self.dec_layers[i](y,
-                                       enc_output,
-                                       self.dec_ahead_mask,
-                                       self.enc_memory_mask,
-                                       training)
-
-            print('y.shape', y.shape)
-            return y
-
-
-    class Transformer(tf.keras.Model):
-        """
-        Complete transformer with an Encoder and a Decoder
-        """
-
-        def __init__(self,
-                     num_layers=G.num_layers,
-                     num_heads=G.num_heads,
-                     dense_dim=G.dense_dim,
-                     src_len=G.src_len,
-                     dec_len = G.dec_len,
-                     tgt_len=G.tgt_len,
-                     max_positional_encoding_input=G.src_len,
-                     max_positional_encoding_target=G.tgt_len):
-            super(Transformer, self).__init__()
-
-            self.tgt_len = tgt_len
-            self.dec_len = dec_len
-            self.src_len = src_len
-
-            self.encoder = Encoder()
-            self.decoder = Decoder()
-
-            self.linear_map = tf.keras.Sequential([
-                tf.keras.layers.Dense(
-                    dense_dim, activation="relu",
-                    kernel_initializer=tf.keras.initializers.HeNormal(),
-                    bias_initializer=tf.keras.initializers.RandomUniform(minval=0.001, maxval=0.02)
-                ),
-                tf.keras.layers.BatchNormalization(momentum=0.97, epsilon=5e-4),
-
-    #!!!!!!!!!!!!activation原来是sigmoid，bias_initializer=tf.keras.initializers.RandomUniform(minval=0.001, maxval=0.005)
-                #!!!!!!!!!!!!!!!!!!dense里面是1，而不是mul（是把d_model数字回归1维最后结果）
-                tf.keras.layers.Dense(1)
-            ])
-
-        def call(self, x, training):
-            """
-            Forward pass for the entire Transformer
-            Arguments:
-                x -- Tensor of shape (G.batch_size, G.window_size, G.num_features)
-                     An array of the windowed voltage, current and soc data
-                training -- Boolean, set to true to activate
-                            the training mode for dropout and batchnorm layers
-            Returns:
-                final_output -- SOC prediction at time t
-
-            """
-            enc_input = x[:, :self.src_len, :]   # (G.batch_size, G.src_len, G.num_features)
-            dec_input = x[:, -self.dec_len:, ]  # only want the SOC thats why -1 is there!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-
-            print(type(dec_input))
-            print('dec_input.shape',dec_input.shape)
-            #dec_input = dec_input.resize_as_(dec_input.shape[0],dec_input.shape[1],1)#(128,3)->(128,3,1)
-
-
-
-
-            enc_output = self.encoder(enc_input, training)  # (G.batch_size, G.src_len, G.num_features)
-            print('enc_output.shape', enc_output.shape)
-
-            dec_output = self.decoder(dec_input, enc_output, training)
-            print('dec_output.shape', dec_output.shape)
-            # (G.batch_size, G.tgt_len, 32)
-
-            final_output = self.linear_map(dec_output)  # (G.batch_size, G.tgt_len, 1)
-
-            print('final_output.shape', final_output.shape)
-            final_output = tf.transpose(final_output,perm=[0,2,1])
-            final_output = Dense(G.tgt_len)(final_output)
-            final_output = tf.transpose(final_output,perm=[0,2,1])
-            print('final_output.shape', final_output.shape)
-            return final_output
-
-    def calculate_accuracy(pre, real):
-        print('pre.shape', pre.shape)
-        print(pre)
-
-        print('real.shape', real.shape)
-        print(real)
-        # MAPE = np.mean(np.abs((pre - real) / real))
-        MAPE = sklearn.metrics.mean_absolute_percentage_error(real,pre)
-        #MAPE = calculate_MAPE(pre,real)
-        RMSE = np.sqrt(np.mean(np.square(pre - real)))
-        MAE = np.mean(np.abs(pre - real))
-        R2 = r2_score(pre, real)
-        dict = {'MAPE': [MAPE], 'RMSE': [RMSE], 'MAE': [MAE], 'R2': [R2]}
-        df = pd.DataFrame(dict)
-        print('最终的准确率和指标如下\n',df)
-        return df
-
-    def up_down_accuracy(real, pre):
-        '''products = []
-
-        print('tf.shape',tf.shape(real))
-        print('pre.shape',pre.shape)
-        for i in tf.range(tf.shape(real)[0]):
-            products.append(real[i] *  pre[i])
-        accuracy = (sum([int(x > 0) for x in products])) / len(products)
-        return accuracy'''
-        print('real.shape', real.shape)
-        print('pre.shape', pre.shape)
-        mse = tf.reduce_mean(tf.square(pre - real))
-        print('mse！！！！！',K.get_value(mse))
-        print('real666.shape', real.shape)
-        print('pre666.shape', pre.shape)#real666.shape (None, 3)  pre666.shape (None, 3)
-        print('real666', real)
-        print('pre666', pre)
-        accu = tf.multiply(real,pre)#矩阵点积，不是乘法，得出正负，正的就是趋势预测正确
-        accu = tf.nn.relu(accu)#relu(x) = max(0,x)
-        accu = tf.sign(accu)#正数变1，0不变
-        accu = tf.reduce_mean(accu)#取平均
-        print('accu！！！！！', K.get_value(accu))#准确率，0.x
-        '''result = tf.compat.v1.Session().run(result)
-    
-        print('resultnumpy', result)
-        accuracy = (sum([int(x > 0) for x in result]))
-        print('loss666', tf.math.reduce_mean(tf.square(real - pre)))'''
-        accu = 1 - accu#loss越小越好，所以1-准确率S
-        #loss = mse + accu * 10 #mse个位数，accu 0.x
-        loss = accu * pow(10, floor(math.log(abs(mse), 10))) + mse
-        return loss#个位数
-
-
-    def denormalize(normalized_value):
-        df = pd.read_csv(filename, usecols=['Adj Close'])
-        list = df['Adj Close']
-        list1 = list.diff(1).dropna()  # list1为list的1阶差分序列,序列的序号从1开始,所以要tolist,这样序号才从0开始. 但是列表不能调用diff
-        # 或者list1 = np.diff(list)[1:]
-        list1 = list1.tolist()
-        list1 = np.array(list1)  # array才能reshape
-        df1 = df.drop(0, axis=0)
-        df1['Adj Close'] = list1
-        df1 = df1.reset_index(drop=True)#index从0开始
-        print(df.head())
-        print(df1.head())
-        data = df.values
-        data1 = df1.values
-        row2 = round(division_rate2 * list1.shape[0])
-        # 训练集和测试集划分
-        test = data1[int(row2): , :]
-        test = test.reshape(-1, 1)#取原来没有归一化的adj数据作为样本
-        standard_scaler = preprocessing.StandardScaler()
-        m = standard_scaler.fit_transform(train)  # 利用m对data进行归一化，并储存df的归一化参数. 用训练集的归一化参数来反归一化y_test和预测值
-
-
-        '反归一化'
-        normalized_value = normalized_value.reshape(-1, 1)
-        new = standard_scaler.inverse_transform(normalized_value)#利用m对normalized_value进行反归一化
-        print('new',new.shape)
-
-        length = y_test.shape[0]
-        residual = data[int(row2) + seq_len : int(row2) + seq_len +  mulpre * length, : ]#差分残差从test的seq-1序号天开始到test的倒数第二天,预测加上前一天的残差对应test[seq:]反归一的真实值,注意y_test和预测值是一致的
-        print('residual', residual.shape)
-
-        sum = new + residual
-        '归一化'
-        '''m = min_max_scaler.fit_transform(train)  # 利用m对train进行归一化，并储存df的归一化参数!!
-        new = min_max_scaler.transform(test)  # 利用m对test也进行归一化,注意这里是transform不能是fit_transform!!!1'''
-        return new,sum#new是差分预测值，sum是没差分的预测值
-
-    df,list,list1 = get_stock_data()
-    X_train, y_train, X_valid, y_valid, X_test, y_test = load_data(df, seq_len, mulpre)
-    tf.keras.backend.clear_session()
-    model = Transformer()
-    model.build(input_shape=[None, G.window_size, G.num_features])#输入的格式
-    model.summary(expand_nested=True)
-
-
-    G.T_i = 1
-    G.T_mult = 2
-    G.T_cur = 0.0
-
-    loss_object = tf.keras.losses.LogCosh()
-
-    optimizer = tf.keras.optimizers.Adam(learning_rate = G.learning_rate,
-                                         beta_1 = 0.9,
-                                         beta_2 = 0.999
-                                        )
-
-    '''#cos_anneal is for the model.fit() call
-    cos_anneal = tf.keras.callbacks.LambdaCallback(on_batch_end = schedule)
-    
-    #progress plot callback
-    pp_update = ProgressCallback()'''
-
-    #metrics改过，原来"mean_absolute_percentage_error"报错
-    model.compile(loss=up_down_accuracy, optimizer=optimizer, metrics=["mse"])
-
-    #x有问题，要window_size!!!!!!!!!!!!!!!!!!!
-    history = model.fit(X_train,y_train,
-                        epochs = G.epochs,
-                        batch_size=G.batch_size,
-                        verbose = 1,
-                        validation_data=(X_valid, y_valid)
-                        )
-
-
-    '''model.evaluate(X_test, y_test,
-                   verbose = 1
-                   )'''
-
-
-
-    s = time.time()
-    predicted_stock_price_multi_head = model.predict(X_test)
-    e = time.time()
-    print('时间', e - s)
-
-    predicted_stock_price_multi_head_dff1, predicted_stock_price_multi_head = denormalize(predicted_stock_price_multi_head)
-    y_test_dff1, y_test = denormalize(y_test)
-
-    stock = i
-    model2 = 'Galformer'
-    csv_path = 'C:/lyx/learning/期刊论文/程序结果/对比图表/' + stock +'/' + model2 + '.xls'
-    df = pd.DataFrame(predicted_stock_price_multi_head)
-    df.columns.name = None
-    df.to_excel(csv_path,index=False,header=None)
-
-
-    accu = np.multiply(predicted_stock_price_multi_head_dff1,y_test_dff1)
-    print('accu的形状', accu.shape)
-    print('accu', accu)
-    accu = np.maximum(accu, 0)
-    print('accu的形状', accu.shape)
-    print('accu', accu)
-    accu = np.sign(accu)
-    print('accu的形状', accu.shape)
-    print('accu', accu)
-    accu = np.mean(accu) * 100
-    print('accu的形状', accu.shape)
-    print('accu', accu)
-    print(f'测试集趋势预测准确率为{accu}%')
-
-    print('predicted_stock_price_multi_head.shape',predicted_stock_price_multi_head.shape)
-    print('predicted_stock_price_multi_head',predicted_stock_price_multi_head)
-
-    predicted_stock_price_multi_head = numpy.ravel(predicted_stock_price_multi_head)
-    y_test = numpy.ravel(y_test)
-
-    calculate_accuracy(predicted_stock_price_multi_head, y_test)
-    print(f'测试集趋势预测准确率为{accu}%')
-
-    plt.ion()
-    plt.figure(figsize = (18,9))
-    plt.plot(y_test, color = 'black', label = 'real')
-    plt.plot(predicted_stock_price_multi_head, color = 'green', label = 'pre')
-    plt.title('Adj closing Price Prediction', fontsize=30)
-    #plt.xticks(range(0,df.shape[0],50),df['Date'].loc[::50],rotation=45)
-    plt.xlabel('Date')
-    plt.ylabel('Adj closing Price')
-    plt.legend(fontsize=18)
-    plt.show()
-    plt.close()
-
-
-    '''
-    predicted_stock_price_multi_head = model.predict(X_train)
-    
-    predicted_stock_price_multi_head = denormalize(predicted_stock_price_multi_head)
-    y_test = denormalize(y_train)
-    
-    print('predicted_stock_price_multi_head.shape',predicted_stock_price_multi_head.shape)
-    print('predicted_stock_price_multi_head',predicted_stock_price_multi_head)
-    
-    predicted_stock_price_multi_head = numpy.ravel(predicted_stock_price_multi_head)
-    y_test = numpy.ravel(y_train)
-    
-    calculate_accuracy(predicted_stock_price_multi_head, y_test)
-    
-    plt.figure(figsize = (18,9))
-    plt.plot(y_test, color = 'black', label = 'real')
-    plt.plot(predicted_stock_price_multi_head, color = 'green', label = 'pre')
-    plt.title('Adj closing Price Prediction', fontsize=30)
-    #plt.xticks(range(0,df.shape[0],50),df['Date'].loc[::50],rotation=45)
-    plt.xlabel('Date')
-    plt.ylabel('Adj closing Price')
-    plt.legend(fontsize=18)
-    plt.show()
-    '''
+class Transformer(nn.Module):
+    """The complete Transformer model."""
+
+    def __init__(self, device, num_layers=G.num_layers, d_model=G.d_model, num_heads=G.num_heads, dense_dim=G.dense_dim,
+                 dropout_rate=G.dropout_rate):
+        super(Transformer, self).__init__()
+        self.device = device
+        self.encoder = Encoder(num_layers, d_model, num_heads, dense_dim, dropout_rate, G.src_len, device)
+        self.decoder = Decoder(num_layers, d_model, num_heads, dense_dim, dropout_rate, G.dec_len, device)
+        self.final_layer = nn.Linear(d_model, G.num_features)
+
+    def forward(self, src, tgt):
+        causal_mask = create_causal_mask(tgt.shape[1], self.device)
+        enc_output = self.encoder(src, None)  # No padding mask for now
+        dec_output = self.decoder(tgt, enc_output, causal_mask)
+        final_output = self.final_layer(dec_output)
+        return final_output
+
+
+# --- Data Loading and Processing ---
+
+def get_stock_data(filename):
+    """Loads and preprocesses stock data from a CSV file."""
+    df = pd.read_csv(filename)
+    df['Adj Close'] = df['Close']
+    df.drop(['Open', 'High', 'Low', 'Volume', 'Date'], axis=1, inplace=True, errors='ignore')
+
+    # Calculate difference
+    diff_values = df['Adj Close'].diff(1).dropna().values
+    df = df.iloc[1:].copy()
+    df['Adj Close'] = diff_values
+
+    return df
+
+
+def load_data(df, seq_len, mul, normalize=True):
+    """Splits data into train/valid/test sets and creates sequences."""
+    data = df.values
+    division_rate1 = 0.6
+    division_rate2 = 0.8
+    row1 = round(division_rate1 * data.shape[0])
+    row2 = round(division_rate2 * data.shape[0])
+
+    train = data[:int(row1), :]
+    valid = data[int(row1):int(row2), :]
+    test = data[int(row2):, :]
+
+    scaler = preprocessing.StandardScaler()
+    if normalize:
+        train = scaler.fit_transform(train)
+        valid = scaler.transform(valid)
+        test = scaler.transform(test)
+
+    def create_dataset(dataset, seq_len, tgt_len, mul):
+        X, y = [], []
+        num_samples = dataset.shape[0] - seq_len - mul + 1
+        for i in range(0, num_samples, mul):
+            X.append(dataset[i:i + seq_len])
+            y.append(dataset[i + seq_len:i + seq_len + tgt_len])
+        return np.array(X), np.array(y)
+
+    X_train, y_train = create_dataset(train, seq_len, G.tgt_len, mul)
+    X_valid, y_valid = create_dataset(valid, seq_len, G.tgt_len, mul)
+    X_test, y_test = create_dataset(test, seq_len, G.tgt_len, mul)
+
+    return X_train, y_train, X_valid, y_valid, X_test, y_test, scaler
+
+
+# --- Loss, Metrics, and Training ---
+
+def up_down_accuracy_loss(pred, real):
+    """Custom loss combining MSE and directional accuracy."""
+    mse = torch.mean(torch.square(pred - real))
+
+    accu = real * pred
+    accu = torch.relu(accu)
+    accu = torch.sign(accu)
+    accu = torch.mean(accu)
+
+    # Combine MSE and directional accuracy
+    loss = mse + (1 - accu) * 0.1  # Weighting factor for directional loss
+    return loss
+
+
+def calculate_metrics(pred, real):
+    """Calculates MAPE, RMSE, MAE, and R2 score."""
+    pred_np = pred.cpu().detach().numpy().flatten()
+    real_np = real.cpu().detach().numpy().flatten()
+
+    MAPE = sklearn.metrics.mean_absolute_percentage_error(real_np, pred_np)
+    RMSE = np.sqrt(sklearn.metrics.mean_squared_error(real_np, pred_np))
+    MAE = sklearn.metrics.mean_absolute_error(real_np, pred_np)
+    R2 = r2_score(real_np, pred_np)
+
+    metrics = {'MAPE': MAPE, 'RMSE': RMSE, 'MAE': MAE, 'R2': R2}
+    print('Evaluation Metrics:\n', pd.DataFrame(metrics, index=[0]))
+    return metrics
+
+
+# --- Main Execution Block ---
+if __name__ == '__main__':
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Example: Use a placeholder for data files if not present
+    try:
+        all_files = [x for x in glob.glob('data/dax40/*.csv', recursive=False)] + \
+                    [x for x in glob.glob('data/indices/^GDAXI.csv', recursive=False)]
+        if not all_files: raise FileNotFoundError
+    except FileNotFoundError:
+        print("Data files not found. Please place stock data in './data/...'")
+        # Create a dummy file for demonstration if none exist
+        dummy_data = {'Date': pd.to_datetime(pd.date_range(start='1/1/2010', periods=1000)),
+                      'Close': np.random.rand(1000) * 100 + 500}
+        dummy_df = pd.DataFrame(dummy_data)
+        dummy_df.to_csv('dummy_stock.csv', index=False)
+        all_files = ['dummy_stock.csv']
+
+    for filename in all_files:
+        print(f"\n--- Processing {filename} ---")
+
+        # 1. Load Data
+        df = get_stock_data(filename)
+        X_train, y_train, X_valid, y_valid, X_test, y_test, scaler = load_data(df, G.src_len, G.mulpr_len)
+
+        # Convert to PyTorch Tensors
+        X_train_t = torch.from_numpy(X_train).float().to(device)
+        y_train_t = torch.from_numpy(y_train).float().to(device)
+        X_valid_t = torch.from_numpy(X_valid).float().to(device)
+        y_valid_t = torch.from_numpy(y_valid).float().to(device)
+        X_test_t = torch.from_numpy(X_test).float().to(device)
+        y_test_t = torch.from_numpy(y_test).float().to(device)
+
+        # Create DataLoader
+        train_dataset = TensorDataset(X_train_t, y_train_t)
+        train_loader = DataLoader(train_dataset, batch_size=G.batch_size, shuffle=True)
+        valid_dataset = TensorDataset(X_valid_t, y_valid_t)
+        valid_loader = DataLoader(valid_dataset, batch_size=G.batch_size)
+
+        # 2. Initialize Model, Optimizer, Loss
+        model = Transformer(device).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=G.learning_rate)
+        criterion = up_down_accuracy_loss
+
+        # 3. Training Loop
+        print("Starting training...")
+        for epoch in range(G.epochs):
+            model.train()
+            total_train_loss = 0
+            for src, tgt in train_loader:
+                # The target for the decoder input is the same as the output in this setup
+                # We use the source as a proxy for the decoder input for the first step
+                dec_input = src[:, -G.dec_len:, :]
+
+                optimizer.zero_grad()
+                output = model(src, dec_input)
+                loss = criterion(output, tgt)
+                loss.backward()
+                optimizer.step()
+                total_train_loss += loss.item()
+
+            avg_train_loss = total_train_loss / len(train_loader)
+
+            # Validation
+            model.eval()
+            total_valid_loss = 0
+            with torch.no_grad():
+                for src, tgt in valid_loader:
+                    dec_input = src[:, -G.dec_len:, :]
+                    output = model(src, dec_input)
+                    loss = criterion(output, tgt)
+                    total_valid_loss += loss.item()
+
+            avg_valid_loss = total_valid_loss / len(valid_loader)
+
+            if (epoch + 1) % 10 == 0:
+                print(
+                    f'Epoch {epoch + 1}/{G.epochs}, Train Loss: {avg_train_loss:.4f}, Valid Loss: {avg_valid_loss:.4f}')
+
+        # 4. Evaluation
+        print("\nStarting evaluation...")
+        model.eval()
+        with torch.no_grad():
+            dec_input_test = X_test_t[:, -G.dec_len:, :]
+            predictions_t = model(X_test_t, dec_input_test)
+
+        # Denormalize predictions and actual values
+        predictions_scaled = scaler.inverse_transform(predictions_t.cpu().numpy().reshape(-1, G.num_features))
+        y_test_scaled = scaler.inverse_transform(y_test.reshape(-1, G.num_features))
+
+        # Calculate metrics on the difference values
+        calculate_metrics(torch.tensor(predictions_scaled), torch.tensor(y_test_scaled))
+
+        # 5. Plotting
+        plt.figure(figsize=(15, 7))
+        plt.plot(y_test_scaled.flatten(), color='black', label='Real Stock Price Change')
+        plt.plot(predictions_scaled.flatten(), color='green', label='Predicted Stock Price Change', alpha=0.7)
+        plt.title(f'Stock Price Change Prediction for {filename.split("/")[-1]}', fontsize=20)
+        plt.xlabel('Time')
+        plt.ylabel('Price Change')
+        plt.legend(fontsize=12)
+        plt.grid(True)
+        plt.show()
+
